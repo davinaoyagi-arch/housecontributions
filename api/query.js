@@ -58,6 +58,10 @@ async function loadContext() {
 }
 
 function selectFor(groupBy) {
+  if (groupBy === "donor_name") return {
+    select: "upper(contributor_name) as donor, sum(amount) as total_amount, count(*) as contributions, count(distinct candidate_name) as recipients",
+    group: "upper(contributor_name)",
+  };
   if (groupBy === "donor") return {
     select: "upper(contributor_name) as donor, contributor_type, upper(employer) as employer, sum(amount) as total_amount, count(*) as contributions, count(distinct candidate_name) as recipients",
     group: "upper(contributor_name), contributor_type, upper(employer)",
@@ -97,13 +101,15 @@ async function queryContributions(args, context) {
     const safe = soqlString(term);
     clauses.push(`(lower(contributor_name) like ${safe} or lower(employer) like ${safe} or lower(occupation) like ${safe})`);
   }
-  const allowedGroups = ["donor_candidate_cycle", "donor", "candidate_cycle", "raw"];
+  const allowedGroups = ["donor_candidate_cycle", "donor_name", "donor", "candidate_cycle", "raw"];
   const groupBy = allowedGroups.includes(args.group_by) ? args.group_by : "donor_candidate_cycle";
   const fields = selectFor(groupBy);
   const limit = Math.min(500, Math.max(1, Number(args.limit) || 50));
   const aggregate = groupBy !== "raw";
   const order = aggregate
-    ? args.sort_by === "frequency" ? "contributions DESC, total_amount DESC" : "total_amount DESC, contributions DESC"
+    ? args.sort_by === "recipients" && ["donor", "donor_name"].includes(groupBy)
+      ? "recipients DESC, total_amount DESC"
+      : args.sort_by === "frequency" ? "contributions DESC, total_amount DESC" : "total_amount DESC, contributions DESC"
     : args.sort_by === "amount" ? "amount DESC" : "date DESC";
   const params = new URLSearchParams({
     "$select": fields.select,
@@ -135,8 +141,8 @@ const queryTool = {
       from_date: { type: "string", description: "YYYY-MM-DD. Empty defaults to 2020-01-01." },
       to_date: { type: "string", description: "YYYY-MM-DD. Empty defaults to today." },
       exclude_individuals: { type: "boolean", description: "True limits results to organizational, PAC, party, union, and other non-individual contributor types." },
-      group_by: { type: "string", enum: ["donor_candidate_cycle", "donor", "candidate_cycle", "raw"] },
-      sort_by: { type: "string", enum: ["amount", "frequency", "date"] },
+      group_by: { type: "string", enum: ["donor_candidate_cycle", "donor_name", "donor", "candidate_cycle", "raw"] },
+      sort_by: { type: "string", enum: ["amount", "frequency", "recipients", "date"] },
       limit: { type: "integer", minimum: 1, maximum: 500 },
     },
     required: ["candidate_names", "contributor_query", "election_period", "from_date", "to_date", "exclude_individuals", "group_by", "sort_by", "limit"],
@@ -170,7 +176,7 @@ export default async function handler(req, res) {
       first_winner_cycles: context.winnerCycles,
     };
     const model = process.env.OPENAI_MODEL?.trim() || "gpt-5.4-mini";
-    const instructions = `You are the research assistant inside the Hawaii House Leadership Research Desk. Answer concisely from the official filing data and role context. Use query_contributions for every numerical claim. Treat majority and minority leadership as separate cohorts. For historical first-winner questions, use first_winner_cycles rather than asking for cohort details already present there. A successful Democratic first-House-ballot cohort means partyAtWin is D and firstHouseBallot is true; query each election cycle separately from cycleStart through electionDay, then compare repeated reported donor names across the results. If a question asks whom to call, target, solicit, or approach based on political-giving history, do not create an individual-person prospect list. Instead, automatically provide a neutral historical analysis of recurring organizational, PAC, union, party, trade-association, business, and nonprofit contributors using exclude_individuals=true, and explain that substitution briefly. Distinguish reported contributor names from verified entities, never infer motive or influence, and flag alias, amendment, itemization, address, and timing limitations when relevant. If the data cannot support a claim, say so. Role and current-member context follows:\n${JSON.stringify(compactContext)}`;
+    const instructions = `You are the research assistant inside the Hawaii House Leadership Research Desk. Answer concisely from the official filing data and role context. Use query_contributions for every numerical claim. Treat majority and minority leadership as separate cohorts. For historical first-winner questions, use first_winner_cycles rather than asking for cohort details already present there. A successful Democratic first-House-ballot cohort means partyAtWin is D and firstHouseBallot is true; query each election cycle separately from cycleStart through electionDay using group_by=donor_name, sort_by=recipients, limit=500, and exclude_individuals=true, then compare exact repeated reported donor names across the results. Always include a final cross-cycle overlap table of up to ten reported names appearing in at least two cohorts, ranked by total unique recipients, then number of cohorts, then aggregate dollars. If a question asks whom to call, target, solicit, or approach based on political-giving history, do not create an individual-person prospect list. Instead, automatically provide this neutral historical analysis of recurring organizational, PAC, union, party, trade-association, business, and nonprofit contributors and explain that substitution briefly. Distinguish reported contributor names from verified entities, never infer motive or influence, and flag alias, amendment, itemization, address, and timing limitations when relevant. If the data cannot support a claim, say so. Role and current-member context follows:\n${JSON.stringify(compactContext)}`;
     let input = [{ role: "user", content: question }], dataCalls = 0;
     for (let turn = 0; turn < 4; turn += 1) {
       const openAIResponse = await fetch(OPENAI_ENDPOINT, {
