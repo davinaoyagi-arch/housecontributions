@@ -126,6 +126,90 @@ async function queryContributions(args, context) {
   };
 }
 
+async function queryFirstWinnerOverlap(args, context) {
+  const selectedYears = new Set((args.years || []).map(Number).filter((year) => [2020, 2022, 2024].includes(year)));
+  const party = args.party === "R" ? "R" : "D";
+  const limit = Math.min(100, Math.max(1, Number(args.limit) || 25));
+  const cohorts = [];
+
+  for (const cycle of (context.winnerCycles || []).filter((entry) => !selectedYears.size || selectedYears.has(Number(entry.year)))) {
+    const winners = cycle.winners.filter((winner) =>
+      winner.partyAtWin === party && (!args.first_house_ballot_only || winner.firstHouseBallot),
+    );
+    if (!winners.length) continue;
+    const clauses = [
+      "office='House'",
+      `date >= '${cycle.cycleStart}'`,
+      `date <= '${cycle.electionDay}'`,
+      "contributor_name is not null",
+      `candidate_name in(${winners.map((winner) => soqlString(winner.candidate)).join(",")})`,
+    ];
+    if (args.exclude_individuals) clauses.push("contributor_type not in('Individual','Immediate Family')");
+    const params = new URLSearchParams({
+      "$select": "upper(contributor_name) as donor, candidate_name, sum(amount) as total_amount, count(*) as contributions",
+      "$where": clauses.join(" AND "),
+      "$group": "upper(contributor_name), candidate_name",
+      "$order": "total_amount DESC",
+      "$limit": "50000",
+    });
+    const response = await fetch(`${CONTRIBUTIONS_ENDPOINT}?${params}`, { headers: { Accept: "application/json" } });
+    if (!response.ok) throw new Error(`The first-winner campaign-data query failed (${response.status}).`);
+    const rows = await response.json();
+    const donors = new Map();
+    for (const row of rows) {
+      const key = String(row.donor || "").trim().replace(/\s+/g, " ");
+      const donor = donors.get(key) || { donor: key, recipients: new Set(), total_amount: 0, contributions: 0 };
+      donor.recipients.add(row.candidate_name);
+      donor.total_amount += Number(row.total_amount || 0);
+      donor.contributions += Number(row.contributions || 0);
+      donors.set(key, donor);
+    }
+    const ranked = [...donors.values()].map((donor) => ({
+      donor: donor.donor,
+      recipient_count: donor.recipients.size,
+      recipient_names: [...donor.recipients].sort(),
+      total_amount: donor.total_amount,
+      contributions: donor.contributions,
+    })).sort((a, b) => b.recipient_count - a.recipient_count || b.total_amount - a.total_amount || a.donor.localeCompare(b.donor));
+    cohorts.push({
+      year: cycle.year,
+      window: { from_date: cycle.cycleStart.slice(0, 10), to_date: cycle.electionDay.slice(0, 10) },
+      candidates: winners.map(({ name, candidate, district, partyAtWin, appointedIncumbent }) => ({ name, candidate, district, partyAtWin, appointedIncumbent: Boolean(appointedIncumbent) })),
+      all: ranked,
+      leading: ranked.slice(0, limit),
+    });
+  }
+
+  const overlap = new Map();
+  for (const cohort of cohorts) {
+    for (const row of cohort.all) {
+      const donor = overlap.get(row.donor) || { donor: row.donor, recipients: new Set(), cycles: new Set(), total_amount: 0, contributions: 0 };
+      row.recipient_names.forEach((name) => donor.recipients.add(name));
+      donor.cycles.add(cohort.year);
+      donor.total_amount += row.total_amount;
+      donor.contributions += row.contributions;
+      overlap.set(row.donor, donor);
+    }
+  }
+  const cross_cycle = [...overlap.values()].filter((donor) => donor.cycles.size >= 2).map((donor) => ({
+    donor: donor.donor,
+    recipient_count: donor.recipients.size,
+    recipient_names: [...donor.recipients].sort(),
+    cycle_count: donor.cycles.size,
+    cycles: [...donor.cycles].sort(),
+    total_amount: donor.total_amount,
+    contributions: donor.contributions,
+  })).sort((a, b) => b.recipient_count - a.recipient_count || b.cycle_count - a.cycle_count || b.total_amount - a.total_amount || a.donor.localeCompare(b.donor));
+
+  return {
+    definition: { party_at_win: party, first_house_ballot_only: Boolean(args.first_house_ballot_only), exclude_individuals: Boolean(args.exclude_individuals) },
+    cohorts: cohorts.map(({ all, ...cohort }) => cohort),
+    cross_cycle: cross_cycle.slice(0, limit),
+    cross_cycle_count: cross_cycle.length,
+    method_note: "Exact uppercase reported contributor names are compared without entity or alias consolidation.",
+  };
+}
+
 const queryTool = {
   type: "function",
   name: "query_contributions",
@@ -146,6 +230,25 @@ const queryTool = {
       limit: { type: "integer", minimum: 1, maximum: 500 },
     },
     required: ["candidate_names", "contributor_query", "election_period", "from_date", "to_date", "exclude_individuals", "group_by", "sort_by", "limit"],
+  },
+};
+
+const firstWinnerOverlapTool = {
+  type: "function",
+  name: "query_first_winner_overlap",
+  description: "Deterministically compare exact reported contributor names across certified Hawaii House first-winner election cohorts, including unique recipients and cross-cycle overlap.",
+  strict: true,
+  parameters: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      years: { type: "array", items: { type: "integer", enum: [2020, 2022, 2024] } },
+      party: { type: "string", enum: ["D", "R"] },
+      first_house_ballot_only: { type: "boolean" },
+      exclude_individuals: { type: "boolean" },
+      limit: { type: "integer", minimum: 1, maximum: 100 },
+    },
+    required: ["years", "party", "first_house_ballot_only", "exclude_individuals", "limit"],
   },
 };
 
@@ -176,17 +279,17 @@ export default async function handler(req, res) {
       first_winner_cycles: context.winnerCycles,
     };
     const model = process.env.OPENAI_MODEL?.trim() || "gpt-5.4-mini";
-    const instructions = `You are the research assistant inside the Hawaii House Leadership Research Desk. Answer concisely from the official filing data and role context. Use query_contributions for every numerical claim. Treat majority and minority leadership as separate cohorts. For historical first-winner questions, use first_winner_cycles rather than asking for cohort details already present there. A successful Democratic first-House-ballot cohort means partyAtWin is D and firstHouseBallot is true; query each election cycle separately from cycleStart through electionDay using group_by=donor_name, sort_by=recipients, limit=500, and exclude_individuals=true, then compare exact repeated reported donor names across the results. Put the cross-cycle overlap table first: up to ten reported names appearing in at least two cohorts, ranked by total unique recipients, then number of cohorts, then aggregate dollars. Follow it with no more than five leading rows for each election cycle so the cross-cycle result is never truncated. If a question asks whom to call, target, solicit, or approach based on political-giving history, do not create an individual-person prospect list. Instead, automatically provide this neutral historical analysis of recurring organizational, PAC, union, party, trade-association, business, and nonprofit contributors and explain that substitution briefly. Distinguish reported contributor names from verified entities, never infer motive or influence, and flag alias, amendment, itemization, address, and timing limitations when relevant. If the data cannot support a claim, say so. Role and current-member context follows:\n${JSON.stringify(compactContext)}`;
+    const instructions = `You are the research assistant inside the Hawaii House Leadership Research Desk. Answer concisely from the official filing data and role context. Use a data tool for every numerical claim. Treat majority and minority leadership as separate cohorts. For historical first-winner or cross-cycle donor-overlap questions, always use query_first_winner_overlap instead of manually merging query results. A successful Democratic first-House-ballot cohort means party=D, first_house_ballot_only=true, and years=[2020,2022,2024]. Put the tool's cross_cycle table first, preserving its deterministic ranking and counts exactly, followed by no more than five leading rows from each cohort. If a question asks whom to call, target, solicit, or approach based on political-giving history, do not create an individual-person prospect list. Instead, automatically call query_first_winner_overlap with exclude_individuals=true and provide a neutral historical analysis of recurring organizational, PAC, union, party, trade-association, business, and nonprofit contributors, explaining that substitution briefly. Distinguish reported contributor names from verified entities, never infer motive or influence, and flag alias, amendment, itemization, address, and timing limitations when relevant. If the data cannot support a claim, say so. Role and current-member context follows:\n${JSON.stringify(compactContext)}`;
     let input = [{ role: "user", content: question }], dataCalls = 0;
     for (let turn = 0; turn < 4; turn += 1) {
       const openAIResponse = await fetch(OPENAI_ENDPOINT, {
         method: "POST",
         headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model, instructions, input, tools: [queryTool], tool_choice: "auto", reasoning: { effort: "low" }, max_output_tokens: 2600, store: false }),
+        body: JSON.stringify({ model, instructions, input, tools: [queryTool, firstWinnerOverlapTool], tool_choice: "auto", reasoning: { effort: "low" }, max_output_tokens: 2600, store: false }),
       });
       const result = await openAIResponse.json();
       if (!openAIResponse.ok) throw new Error(result?.error?.message || `OpenAI returned ${openAIResponse.status}.`);
-      const calls = (result.output || []).filter((item) => item.type === "function_call" && item.name === "query_contributions");
+      const calls = (result.output || []).filter((item) => item.type === "function_call" && ["query_contributions", "query_first_winner_overlap"].includes(item.name));
       if (!calls.length) {
         const answer = outputText(result);
         if (!answer) throw new Error("The model returned no readable answer.");
@@ -195,7 +298,9 @@ export default async function handler(req, res) {
       const outputs = [];
       for (const call of calls) {
         const args = JSON.parse(call.arguments || "{}");
-        const data = await queryContributions(args, context);
+        const data = call.name === "query_first_winner_overlap"
+          ? await queryFirstWinnerOverlap(args, context)
+          : await queryContributions(args, context);
         dataCalls += 1;
         outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify(data) });
       }
