@@ -3,6 +3,7 @@ const CONTRIBUTIONS_ENDPOINT = "https://hicscdata.hawaii.gov/resource/jexd-xbcg.
 const PUBLIC_RESEARCH_SITE = "https://davinaoyagi-arch.github.io/housecontributions/";
 const requestBuckets = new Map();
 let contextCache;
+let horizonCache;
 
 function allowedOrigin() {
   return process.env.RESEARCH_ALLOWED_ORIGIN?.trim() || "https://davinaoyagi-arch.github.io";
@@ -53,8 +54,26 @@ async function loadContext() {
     periods: source.periods,
     roleChanges: source.roleChanges,
     winnerCycles: source.winnerCycles,
+    suppliedFileAudit: source.suppliedFileAudit,
   };
   return contextCache;
+}
+
+async function currentMemberDataHorizon(context) {
+  const now = Date.now();
+  if (horizonCache && now - horizonCache.checkedAt < 15 * 60_000) return horizonCache.date;
+  const candidates = context.currentMembers.map((member) => member.candidate);
+  const params = new URLSearchParams({
+    "$select": "max(date) as latest",
+    "$where": `office='House' AND date >= '2026-01-01T00:00:00' AND candidate_name in(${candidates.map(soqlString).join(",")})`,
+  });
+  const response = await fetch(`${CONTRIBUTIONS_ENDPOINT}?${params}`, { headers: { Accept: "application/json" } });
+  if (!response.ok) throw new Error(`The state campaign-data horizon query failed (${response.status}).`);
+  const rows = await response.json();
+  const fallback = context.suppliedFileAudit?.current_member_end_date || "2026-04-22";
+  const date = String(rows[0]?.latest || fallback).slice(0, 10);
+  horizonCache = { date, checkedAt: now };
+  return date;
 }
 
 function selectFor(groupBy) {
@@ -87,7 +106,10 @@ async function queryContributions(args, context) {
   const requested = (args.candidate_names || []).map((name) => canonical.get(String(name).toLocaleLowerCase())).filter(Boolean);
   const candidates = requested.length ? [...new Set(requested)] : allCandidates;
   const fromDate = validDate(args.from_date || "", "2020-01-01");
-  const toDate = validDate(args.to_date || "", new Date().toISOString().slice(0, 10));
+  const dataAvailableThrough = await currentMemberDataHorizon(context);
+  const requestedToDate = validDate(args.to_date || "", "");
+  const toDate = requestedToDate && requestedToDate < dataAvailableThrough ? requestedToDate : dataAvailableThrough;
+  if (fromDate > toDate) throw new Error(`The requested start date is later than the latest available current-member receipt (${dataAvailableThrough}).`);
   const clauses = [
     "office='House'",
     `date >= '${fromDate}T00:00:00'`,
@@ -121,7 +143,7 @@ async function queryContributions(args, context) {
   const response = await fetch(`${CONTRIBUTIONS_ENDPOINT}?${params}`, { headers: { Accept: "application/json" } });
   if (!response.ok) throw new Error(`The state campaign-data query failed (${response.status}).`);
   return {
-    filters: { candidates: candidates.length, from_date: fromDate, to_date: toDate, election_period: args.election_period || "all", exclude_individuals: Boolean(args.exclude_individuals) },
+    filters: { candidates: candidates.length, from_date: fromDate, to_date: toDate, data_available_through: dataAvailableThrough, election_period: args.election_period || "all", exclude_individuals: Boolean(args.exclude_individuals) },
     rows: await response.json(),
   };
 }
@@ -223,7 +245,7 @@ const queryTool = {
       contributor_query: { type: "string", description: "Optional donor, employer, or occupation word fragment. Empty means any." },
       election_period: { type: "string", description: "Exact reported cycle, such as 2024-2026. Empty means any." },
       from_date: { type: "string", description: "YYYY-MM-DD. Empty defaults to 2020-01-01." },
-      to_date: { type: "string", description: "YYYY-MM-DD. Empty defaults to today." },
+      to_date: { type: "string", description: "YYYY-MM-DD. Empty defaults to the latest available 2026 receipt for the current elected House roster." },
       exclude_individuals: { type: "boolean", description: "True limits results to organizational, PAC, party, union, and other non-individual contributor types." },
       group_by: { type: "string", enum: ["donor_candidate_cycle", "donor_name", "donor", "candidate_cycle", "raw"] },
       sort_by: { type: "string", enum: ["amount", "frequency", "recipients", "date"] },
@@ -279,7 +301,7 @@ export default async function handler(req, res) {
       first_winner_cycles: context.winnerCycles,
     };
     const model = process.env.OPENAI_MODEL?.trim() || "gpt-5.4-mini";
-    const instructions = `You are the research assistant inside the Hawaii House Leadership Research Desk. Answer concisely from the official filing data and role context. Use a data tool for every numerical claim. Treat majority and minority leadership as separate cohorts. For historical first-winner or cross-cycle donor-overlap questions, always use query_first_winner_overlap instead of manually merging query results. A successful Democratic first-House-ballot cohort means party=D, first_house_ballot_only=true, and years=[2020,2022,2024]. Put the tool's cross_cycle table first, preserving its deterministic ranking and counts exactly, followed by no more than five leading rows from each cohort. If a question asks whom to call, target, solicit, or approach based on political-giving history, do not create an individual-person prospect list. Instead, automatically call query_first_winner_overlap with exclude_individuals=true and provide a neutral historical analysis of recurring organizational, PAC, union, party, trade-association, business, and nonprofit contributors, explaining that substitution briefly. Distinguish reported contributor names from verified entities, never infer motive or influence, and flag alias, amendment, itemization, address, and timing limitations when relevant. If the data cannot support a claim, say so. Role and current-member context follows:\n${JSON.stringify(compactContext)}`;
+    const instructions = `You are the research assistant inside the Hawaii House Leadership Research Desk. Answer concisely from the official filing data and role context. Use a data tool for every numerical claim. All ordinary lookups stay limited to the current elected House roster. For current, latest, recent, or 2026 contribution questions, use the reported 2024-2026 election period when appropriate and leave to_date empty so the tool includes records through the latest available 2026 current-member receipt; never stop at December 31, 2025 unless the user explicitly requests that cutoff. Treat majority and minority leadership as separate cohorts. For historical first-winner or cross-cycle donor-overlap questions, always use query_first_winner_overlap instead of manually merging query results. A successful Democratic first-House-ballot cohort means party=D, first_house_ballot_only=true, and years=[2020,2022,2024]. Put the tool's cross_cycle table first, preserving its deterministic ranking and counts exactly, followed by no more than five leading rows from each cohort. If a question asks whom to call, target, solicit, or approach based on political-giving history, do not create an individual-person prospect list. Instead, automatically call query_first_winner_overlap with exclude_individuals=true and provide a neutral historical analysis of recurring organizational, PAC, union, party, trade-association, business, and nonprofit contributors, explaining that substitution briefly. Distinguish reported contributor names from verified entities, never infer motive or influence, and flag alias, amendment, itemization, address, and timing limitations when relevant. If the data cannot support a claim, say so. Role and current-member context follows:\n${JSON.stringify(compactContext)}`;
     let input = [{ role: "user", content: question }], dataCalls = 0;
     for (let turn = 0; turn < 4; turn += 1) {
       const openAIResponse = await fetch(OPENAI_ENDPOINT, {
