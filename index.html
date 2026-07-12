@@ -192,7 +192,7 @@
     </section>
     <section class="section donor-finder" id="donors">
       <div class="section-head compact">
-        <div><p class="eyebrow">DONOR RESEARCH FILES</p><h2>Open a donorâ€™s full contribution profile.</h2></div>
+        <div><p class="eyebrow">DONOR RESEARCH FILES</p><h2>Open a donor's full contribution profile.</h2></div>
         <p>Search reported contributor names across every current House member. Select a result to review aggregate giving by cycle, recipients, filing details, addresses, and saved workspace contacts.</p>
       </div>
       <form id="donor-finder-form" class="donor-finder-tools" role="search">
@@ -490,8 +490,8 @@
     function renderDonorFinder(rows,message='',error=false){
       const results=$('donor-finder-results'),note=$('donor-finder-note'),button=$('donor-finder-submit');donorFinderRows=rows;button.disabled=!rows.length;
       if(message){note.textContent=message;results.innerHTML=rows.length?'':`<p class="donor-finder-message${error?' error':''}">${esc(message)}</p>`;return}
-      note.textContent=`${rows.length.toLocaleString()} matching reported donor name${rows.length===1?'':'s'} Â· press Enter to open the best match`;
-      results.innerHTML=rows.map(row=>`<button type="button" class="donor-file-card" data-donor-profile="${esc(row.donor)}"><span><strong>${esc(row.donor)}</strong><small>${row.contributions.toLocaleString()} contribution${row.contributions===1?'':'s'} Â· ${row.recipients.toLocaleString()} current House recipient${row.recipients===1?'':'s'} Â· latest ${profileDate(row.latest)}</small></span><span><b>${money.format(row.total)}</b><em>Open profile â€º</em></span></button>`).join('')
+      note.textContent=`${rows.length.toLocaleString()} matching reported donor name${rows.length===1?'':'s'} · press Enter to open the best match`;
+      results.innerHTML=rows.map(row=>`<button type="button" class="donor-file-card" data-donor-profile="${esc(row.donor)}"><span><strong>${esc(row.donor)}</strong><small>${row.contributions.toLocaleString()} contribution${row.contributions===1?'':'s'} · ${row.recipients.toLocaleString()} current House recipient${row.recipients===1?'':'s'} · latest ${profileDate(row.latest)}</small></span><span><b>${money.format(row.total)}</b><em>Open profile ›</em></span></button>`).join('')
     }
     async function searchDonorFinder(value,openBest=false){
       const term=String(value||'').trim(),request=++donorFinderRequest;donorFinderQuery=term;$('donor-finder-submit').disabled=true;
