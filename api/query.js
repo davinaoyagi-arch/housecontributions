@@ -190,7 +190,13 @@ export default async function handler(req, res) {
         dataCalls += 1;
         outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify(data) });
       }
-      input = [...input, ...(result.output || []), ...outputs];
+      const callInputs = calls.map((call) => ({
+        type: "function_call",
+        call_id: call.call_id,
+        name: call.name,
+        arguments: call.arguments || "{}",
+      }));
+      input = [...input, ...callInputs, ...outputs];
     }
     return res.status(422).json({ error: "Please narrow the question." });
   } catch (error) {
