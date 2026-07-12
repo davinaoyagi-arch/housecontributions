@@ -78,7 +78,8 @@ function selectFor(groupBy) {
 
 async function queryContributions(args, context) {
   const allCandidates = context.currentMembers.map((member) => member.candidate);
-  const canonical = new Map(allCandidates.map((name) => [name.toLocaleLowerCase(), name]));
+  const historicalCandidates = (context.winnerCycles || []).flatMap((cycle) => cycle.winners.map((winner) => winner.candidate));
+  const canonical = new Map([...allCandidates, ...historicalCandidates].map((name) => [name.toLocaleLowerCase(), name]));
   const requested = (args.candidate_names || []).map((name) => canonical.get(String(name).toLocaleLowerCase())).filter(Boolean);
   const candidates = requested.length ? [...new Set(requested)] : allCandidates;
   const fromDate = validDate(args.from_date || "", "2020-01-01");
@@ -90,6 +91,7 @@ async function queryContributions(args, context) {
     `candidate_name in(${candidates.map(soqlString).join(",")})`,
   ];
   if (args.election_period?.trim()) clauses.push(`election_period=${soqlString(args.election_period.trim())}`);
+  if (args.exclude_individuals) clauses.push("contributor_type not in('Individual','Immediate Family')");
   if (args.contributor_query?.trim()) {
     const term = `%${args.contributor_query.trim().toLocaleLowerCase().replaceAll("%", "")}%`;
     const safe = soqlString(term);
@@ -113,7 +115,7 @@ async function queryContributions(args, context) {
   const response = await fetch(`${CONTRIBUTIONS_ENDPOINT}?${params}`, { headers: { Accept: "application/json" } });
   if (!response.ok) throw new Error(`The state campaign-data query failed (${response.status}).`);
   return {
-    filters: { candidates: candidates.length, from_date: fromDate, to_date: toDate, election_period: args.election_period || "all" },
+    filters: { candidates: candidates.length, from_date: fromDate, to_date: toDate, election_period: args.election_period || "all", exclude_individuals: Boolean(args.exclude_individuals) },
     rows: await response.json(),
   };
 }
@@ -121,7 +123,7 @@ async function queryContributions(args, context) {
 const queryTool = {
   type: "function",
   name: "query_contributions",
-  description: "Query Hawaii Campaign Spending Commission Schedule A receipts for current Hawaii House members. Use this for every numerical contribution claim.",
+  description: "Query Hawaii Campaign Spending Commission Schedule A receipts for current Hawaii House members and certified historical first-winner cohorts. Use this for every numerical contribution claim.",
   strict: true,
   parameters: {
     type: "object",
@@ -132,11 +134,12 @@ const queryTool = {
       election_period: { type: "string", description: "Exact reported cycle, such as 2024-2026. Empty means any." },
       from_date: { type: "string", description: "YYYY-MM-DD. Empty defaults to 2020-01-01." },
       to_date: { type: "string", description: "YYYY-MM-DD. Empty defaults to today." },
+      exclude_individuals: { type: "boolean", description: "True limits results to organizational, PAC, party, union, and other non-individual contributor types." },
       group_by: { type: "string", enum: ["donor_candidate_cycle", "donor", "candidate_cycle", "raw"] },
       sort_by: { type: "string", enum: ["amount", "frequency", "date"] },
       limit: { type: "integer", minimum: 1, maximum: 500 },
     },
-    required: ["candidate_names", "contributor_query", "election_period", "from_date", "to_date", "group_by", "sort_by", "limit"],
+    required: ["candidate_names", "contributor_query", "election_period", "from_date", "to_date", "exclude_individuals", "group_by", "sort_by", "limit"],
   },
 };
 
@@ -167,7 +170,7 @@ export default async function handler(req, res) {
       first_winner_cycles: context.winnerCycles,
     };
     const model = process.env.OPENAI_MODEL?.trim() || "gpt-5.4-mini";
-    const instructions = `You are the research assistant inside the Hawaii House Leadership Research Desk. Answer concisely from the official filing data and role context. Use query_contributions for every numerical claim. Treat majority and minority leadership as separate cohorts. Distinguish reported contributor names from verified entities, never infer motive or influence, and flag alias, amendment, itemization, address, and timing limitations when relevant. If the data cannot support a claim, say so. Role and current-member context follows:\n${JSON.stringify(compactContext)}`;
+    const instructions = `You are the research assistant inside the Hawaii House Leadership Research Desk. Answer concisely from the official filing data and role context. Use query_contributions for every numerical claim. Treat majority and minority leadership as separate cohorts. For historical first-winner questions, use first_winner_cycles rather than asking for cohort details already present there. A successful Democratic first-House-ballot cohort means partyAtWin is D and firstHouseBallot is true; query each election cycle separately from cycleStart through electionDay, then compare repeated reported donor names across the results. If a question asks whom to call, target, solicit, or approach based on political-giving history, do not create an individual-person prospect list. Instead, automatically provide a neutral historical analysis of recurring organizational, PAC, union, party, trade-association, business, and nonprofit contributors using exclude_individuals=true, and explain that substitution briefly. Distinguish reported contributor names from verified entities, never infer motive or influence, and flag alias, amendment, itemization, address, and timing limitations when relevant. If the data cannot support a claim, say so. Role and current-member context follows:\n${JSON.stringify(compactContext)}`;
     let input = [{ role: "user", content: question }], dataCalls = 0;
     for (let turn = 0; turn < 4; turn += 1) {
       const openAIResponse = await fetch(OPENAI_ENDPOINT, {
