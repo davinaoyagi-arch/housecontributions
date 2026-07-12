@@ -59,11 +59,11 @@ async function loadContext() {
 
 function selectFor(groupBy) {
   if (groupBy === "donor") return {
-    select: "upper(contributor_name) as donor, contributor_type, upper(employer) as employer, sum(amount) as total_amount, count(*) as gifts, count(distinct candidate_name) as recipients",
+    select: "upper(contributor_name) as donor, contributor_type, upper(employer) as employer, sum(amount) as total_amount, count(*) as contributions, count(distinct candidate_name) as recipients",
     group: "upper(contributor_name), contributor_type, upper(employer)",
   };
   if (groupBy === "candidate_cycle") return {
-    select: "candidate_name, election_period, sum(amount) as total_amount, count(*) as gifts, count(distinct contributor_name) as donors",
+    select: "candidate_name, election_period, sum(amount) as total_amount, count(*) as contributions, count(distinct contributor_name) as donors",
     group: "candidate_name, election_period",
   };
   if (groupBy === "raw") return {
@@ -71,7 +71,7 @@ function selectFor(groupBy) {
     group: "",
   };
   return {
-    select: "upper(contributor_name) as donor, candidate_name, election_period, contributor_type, upper(employer) as employer, sum(amount) as total_amount, count(*) as gifts",
+    select: "upper(contributor_name) as donor, candidate_name, election_period, contributor_type, upper(employer) as employer, sum(amount) as total_amount, count(*) as contributions",
     group: "upper(contributor_name), candidate_name, election_period, contributor_type, upper(employer)",
   };
 }
@@ -101,7 +101,7 @@ async function queryContributions(args, context) {
   const limit = Math.min(500, Math.max(1, Number(args.limit) || 50));
   const aggregate = groupBy !== "raw";
   const order = aggregate
-    ? args.sort_by === "frequency" ? "gifts DESC, total_amount DESC" : "total_amount DESC, gifts DESC"
+    ? args.sort_by === "frequency" ? "contributions DESC, total_amount DESC" : "total_amount DESC, contributions DESC"
     : args.sort_by === "amount" ? "amount DESC" : "date DESC";
   const params = new URLSearchParams({
     "$select": fields.select,
