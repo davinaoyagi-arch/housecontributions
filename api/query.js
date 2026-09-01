@@ -3,7 +3,7 @@ const CONTRIBUTIONS_ENDPOINT = "https://hicscdata.hawaii.gov/resource/jexd-xbcg.
 const PUBLIC_RESEARCH_SITE = "https://davinaoyagi-arch.github.io/housecontributions/";
 const requestBuckets = new Map();
 let contextCache;
-let horizonCache;
+const horizonCache = new Map();
 
 function allowedOrigin() {
   return process.env.RESEARCH_ALLOWED_ORIGIN?.trim() || "https://davinaoyagi-arch.github.io";
@@ -42,22 +42,28 @@ function validDate(value, fallback) {
 }
 
 async function loadContext() {
-  if (contextCache) return contextCache;
+  const now = Date.now();
+  if (contextCache && now - contextCache.checkedAt < 5 * 60_000) return contextCache.value;
   const response = await fetch(PUBLIC_RESEARCH_SITE, { headers: { Accept: "text/html" } });
-  if (!response.ok) throw new Error("The House research context could not be loaded.");
+  if (!response.ok) throw new Error("The legislative research context could not be loaded.");
   const html = await response.text();
   const match = html.match(/window\.HOUSE_DATA=(\{.*?\});<\/script>/s);
-  if (!match) throw new Error("The House research context was not found in the public site.");
+  if (!match) throw new Error("The legislative research context was not found in the public site.");
   const source = JSON.parse(match[1]);
-  contextCache = {
+  const value = {
     currentMembers: source.currentMembers,
     formerHouseMembers: source.formerHouseMembers || [],
+    currentSenators: source.currentSenators || [],
+    formerSenators: source.formerSenators || [],
     periods: source.periods,
+    senatePeriods: source.senatePeriods || {},
     roleChanges: source.roleChanges,
+    senateRoleChanges: source.senateRoleChanges || [],
     winnerCycles: source.winnerCycles,
     suppliedFileAudit: source.suppliedFileAudit,
   };
-  return contextCache;
+  contextCache = { value, checkedAt: now };
+  return value;
 }
 
 function normalizeMemberName(value) {
@@ -70,80 +76,104 @@ function normalizeMemberName(value) {
 }
 
 function trackedMembers(context) {
-  const members = [...(context.currentMembers || []), ...(context.formerHouseMembers || [])];
-  return [...new Map(members.map((member) => [member.candidate, member])).values()];
+  const house = [...(context.currentMembers || []).map((member) => ({ ...member, chamber: "House", current: true })), ...(context.formerHouseMembers || []).map((member) => ({ ...member, chamber: "House" }))];
+  const senate = [...(context.currentSenators || []).map((member) => ({ ...member, chamber: "Senate", current: true })), ...(context.formerSenators || []).map((member) => ({ ...member, chamber: "Senate" }))];
+  return [...new Map([...house, ...senate].map((member) => [`${member.chamber}:${member.candidate}`, member])).values()];
 }
 
 function memberAliases(member) {
   const [last = "", given = ""] = String(member.candidate || "").split(",");
   const first = given.trim().split(/\s+/)[0] || "";
-  return [member.candidate, member.name, `${first} ${last}`, last].map(normalizeMemberName).filter(Boolean);
+  return [member.candidate, ...(member.filingAliases || []), member.name, `${first} ${last}`, last, `${member.chamber} ${member.name}`, `${member.chamber} ${first} ${last}`, `${member.chamber} ${last}`].map(normalizeMemberName).filter(Boolean);
 }
 
-function resolveMember(value, context) {
+function resolveMember(value, context, chamber = "both") {
   const needle = normalizeMemberName(value);
-  if (!needle) throw new Error("A House member name is required.");
-  const matches = trackedMembers(context).filter((member) => memberAliases(member).includes(needle));
+  if (!needle) throw new Error("A House or Senate member name is required.");
+  const chamberName = chamber === "senate" ? "Senate" : chamber === "house" ? "House" : "";
+  const matches = trackedMembers(context).filter((member) => (!chamberName || member.chamber === chamberName) && memberAliases(member).includes(needle));
   if (matches.length === 1) return matches[0];
-  if (matches.length > 1) throw new Error(`The House member name ${JSON.stringify(value)} is ambiguous. Use the full name.`);
-  throw new Error(`No current or former 2020-2026 House member matched ${JSON.stringify(value)}.`);
+  if (matches.length > 1) throw new Error(`The member name ${JSON.stringify(value)} is ambiguous. Include House or Senate with the full name.`);
+  throw new Error(`No current or former 2020-2026 House or Senate officeholder matched ${JSON.stringify(value)}.`);
 }
 
-async function currentMemberDataHorizon(context) {
+function currentRoster(context, chamber) {
+  return chamber === "Senate" ? context.currentSenators : context.currentMembers;
+}
+
+async function currentMemberDataHorizon(context, chamber = "House") {
   const now = Date.now();
-  if (horizonCache && now - horizonCache.checkedAt < 15 * 60_000) return horizonCache.date;
-  const candidates = context.currentMembers.map((member) => member.candidate);
+  const cached = horizonCache.get(chamber);
+  if (cached && now - cached.checkedAt < 15 * 60_000) return cached.date;
+  const candidates = currentRoster(context, chamber).flatMap((member) => member.filingAliases?.length ? member.filingAliases : [member.candidate]);
   const params = new URLSearchParams({
     "$select": "max(date) as latest",
-    "$where": `office='House' AND date >= '2026-01-01T00:00:00' AND candidate_name in(${candidates.map(soqlString).join(",")})`,
+    "$where": `office=${soqlString(chamber)} AND date >= '2026-01-01T00:00:00' AND candidate_name in(${candidates.map(soqlString).join(",")})`,
   });
   const response = await fetch(`${CONTRIBUTIONS_ENDPOINT}?${params}`, { headers: { Accept: "application/json" } });
   if (!response.ok) throw new Error(`The state campaign-data horizon query failed (${response.status}).`);
   const rows = await response.json();
-  const fallback = context.suppliedFileAudit?.current_member_end_date || "2026-04-22";
+  const fallback = chamber === "Senate" ? "2026-08-05" : context.suppliedFileAudit?.current_member_end_date || "2026-04-22";
   const date = String(rows[0]?.latest || fallback).slice(0, 10);
-  horizonCache = { date, checkedAt: now };
+  horizonCache.set(chamber, { date, checkedAt: now });
   return date;
 }
 
 function selectFor(groupBy) {
   if (groupBy === "donor_name") return {
-    select: "upper(contributor_name) as donor, sum(amount) as total_amount, count(*) as contributions, count(distinct candidate_name) as recipients",
-    group: "upper(contributor_name)",
+    select: "office, upper(contributor_name) as donor, sum(amount) as total_amount, count(*) as contributions, count(distinct candidate_name) as recipients",
+    group: "office, upper(contributor_name)",
   };
   if (groupBy === "donor") return {
-    select: "upper(contributor_name) as donor, contributor_type, upper(employer) as employer, sum(amount) as total_amount, count(*) as contributions, count(distinct candidate_name) as recipients",
-    group: "upper(contributor_name), contributor_type, upper(employer)",
+    select: "office, upper(contributor_name) as donor, contributor_type, upper(employer) as employer, sum(amount) as total_amount, count(*) as contributions, count(distinct candidate_name) as recipients",
+    group: "office, upper(contributor_name), contributor_type, upper(employer)",
   };
   if (groupBy === "candidate_cycle") return {
-    select: "candidate_name, election_period, sum(amount) as total_amount, count(*) as contributions, count(distinct contributor_name) as donors",
-    group: "candidate_name, election_period",
+    select: "office, candidate_name, election_period, sum(amount) as total_amount, count(*) as contributions, count(distinct contributor_name) as donors",
+    group: "office, candidate_name, election_period",
   };
   if (groupBy === "raw") return {
-    select: "contributor_name, candidate_name, date, amount, election_period, contributor_type, employer, occupation, city, state",
+    select: "office, contributor_name, candidate_name, date, amount, election_period, contributor_type, employer, occupation, city, state",
     group: "",
   };
   return {
-    select: "upper(contributor_name) as donor, candidate_name, election_period, contributor_type, upper(employer) as employer, sum(amount) as total_amount, count(*) as contributions",
-    group: "upper(contributor_name), candidate_name, election_period, contributor_type, upper(employer)",
+    select: "office, upper(contributor_name) as donor, candidate_name, election_period, contributor_type, upper(employer) as employer, sum(amount) as total_amount, count(*) as contributions",
+    group: "office, upper(contributor_name), candidate_name, election_period, contributor_type, upper(employer)",
   };
 }
 
+function memberFilingNames(member) {
+  return member.filingAliases?.length ? member.filingAliases : [member.candidate];
+}
+
+function memberUniverseClause(members) {
+  const grouped = new Map();
+  for (const member of members) {
+    const names = grouped.get(member.chamber) || new Set();
+    memberFilingNames(member).forEach((name) => names.add(name));
+    grouped.set(member.chamber, names);
+  }
+  return `(${[...grouped.entries()].map(([chamber, names]) => `(office=${soqlString(chamber)} AND candidate_name in(${[...names].map(soqlString).join(",")}))`).join(" OR ")})`;
+}
+
 async function queryContributions(args, context) {
-  const allCandidates = context.currentMembers.map((member) => member.candidate);
+  const chamberMode = args.chamber === "senate" ? "senate" : args.chamber === "both" ? "both" : "house";
+  const current = trackedMembers(context).filter((member) => member.current && (chamberMode === "both" || member.chamber.toLowerCase() === chamberMode));
   const requestedInputs = (args.candidate_names || []).filter((name) => String(name).trim());
-  const requested = requestedInputs.map((name) => resolveMember(name, context).candidate);
-  const candidates = requested.length ? [...new Set(requested)] : allCandidates;
+  const requested = requestedInputs.map((name) => resolveMember(name, context, chamberMode));
+  const members = requested.length ? [...new Map(requested.map((member) => [`${member.chamber}:${member.candidate}`, member])).values()] : current;
+  if (!members.length) throw new Error("No tracked officeholders matched this chamber scope.");
   const fromDate = validDate(args.from_date || "", "2020-01-01");
-  const dataAvailableThrough = await currentMemberDataHorizon(context);
+  const chambers = [...new Set(members.map((member) => member.chamber))];
+  const horizonEntries = await Promise.all(chambers.map(async (chamber) => [chamber, await currentMemberDataHorizon(context, chamber)]));
+  const dataAvailableThrough = horizonEntries.map(([, date]) => date).sort()[0];
   const requestedToDate = validDate(args.to_date || "", "");
   const toDate = requestedToDate && requestedToDate < dataAvailableThrough ? requestedToDate : dataAvailableThrough;
   if (fromDate > toDate) throw new Error(`The requested start date is later than the latest available current-member receipt (${dataAvailableThrough}).`);
   const clauses = [
-    "office='House'",
+    memberUniverseClause(members),
     `date >= '${fromDate}T00:00:00'`,
     `date <= '${toDate}T23:59:59'`,
-    `candidate_name in(${candidates.map(soqlString).join(",")})`,
   ];
   if (args.election_period?.trim()) clauses.push(`election_period=${soqlString(args.election_period.trim())}`);
   if (args.exclude_individuals) clauses.push("contributor_type not in('Individual','Immediate Family')");
@@ -172,12 +202,12 @@ async function queryContributions(args, context) {
   const response = await fetch(`${CONTRIBUTIONS_ENDPOINT}?${params}`, { headers: { Accept: "application/json" } });
   if (!response.ok) throw new Error(`The state campaign-data query failed (${response.status}).`);
   return {
-    filters: { candidates: candidates.length, from_date: fromDate, to_date: toDate, data_available_through: dataAvailableThrough, election_period: args.election_period || "all", exclude_individuals: Boolean(args.exclude_individuals) },
+    filters: { chamber: chamberMode, candidates: members.length, from_date: fromDate, to_date: toDate, data_available_through: dataAvailableThrough, chamber_horizons: Object.fromEntries(horizonEntries), election_period: args.election_period || "all", exclude_individuals: Boolean(args.exclude_individuals) },
     rows: await response.json(),
   };
 }
 
-function rankedMemberDonors(rows, firstCandidate, secondCandidate, sortBy) {
+function rankedMemberDonors(rows, firstMember, secondMember, sortBy) {
   const donors = new Map();
   for (const row of rows) {
     const donorName = String(row.donor || "").trim().replace(/\s+/g, " ");
@@ -188,7 +218,7 @@ function rankedMemberDonors(rows, firstCandidate, secondCandidate, sortBy) {
       first: { total_amount: 0, contributions: 0, latest: "" },
       second: { total_amount: 0, contributions: 0, latest: "" },
     };
-    const side = row.candidate_name === firstCandidate ? donor.first : row.candidate_name === secondCandidate ? donor.second : null;
+    const side = row.office === firstMember.chamber && memberFilingNames(firstMember).includes(row.candidate_name) ? donor.first : row.office === secondMember.chamber && memberFilingNames(secondMember).includes(row.candidate_name) ? donor.second : null;
     if (!side) continue;
     side.total_amount += Number(row.total_amount || 0);
     side.contributions += Number(row.contributions || 0);
@@ -221,40 +251,40 @@ function rankedMemberDonors(rows, firstCandidate, secondCandidate, sortBy) {
 }
 
 async function compareMemberDonors(args, context) {
-  const first = resolveMember(args.first_candidate, context);
-  const second = resolveMember(args.second_candidate, context);
-  if (first.candidate === second.candidate) throw new Error("Choose two different House members to compare.");
+  const first = resolveMember(args.first_candidate, context, "both");
+  const second = resolveMember(args.second_candidate, context, "both");
+  if (first.chamber === second.chamber && first.candidate === second.candidate) throw new Error("Choose two different legislative officeholders to compare.");
   const fromDate = validDate(args.from_date || "", "2020-01-01");
-  const dataAvailableThrough = await currentMemberDataHorizon(context);
+  const chamberEntries = await Promise.all([...new Set([first.chamber, second.chamber])].map(async (chamber) => [chamber, await currentMemberDataHorizon(context, chamber)]));
+  const dataAvailableThrough = chamberEntries.map(([, date]) => date).sort()[0];
   const requestedToDate = validDate(args.to_date || "", "");
   const toDate = requestedToDate && requestedToDate < dataAvailableThrough ? requestedToDate : dataAvailableThrough;
   if (fromDate > toDate) throw new Error(`The requested start date is later than the latest available receipt (${dataAvailableThrough}).`);
   const clauses = [
-    "office='House'",
+    memberUniverseClause([first, second]),
     "contributor_name is not null",
     `date >= '${fromDate}T00:00:00'`,
     `date <= '${toDate}T23:59:59'`,
-    `candidate_name in(${[first.candidate, second.candidate].map(soqlString).join(",")})`,
   ];
   if (args.election_period?.trim()) clauses.push(`election_period=${soqlString(args.election_period.trim())}`);
   if (args.exclude_individuals) clauses.push("contributor_type not in('Individual','Immediate Family')");
   const params = new URLSearchParams({
-    "$select": "upper(contributor_name) as donor, candidate_name, contributor_type, sum(amount) as total_amount, count(*) as contributions, max(date) as latest",
+    "$select": "office, upper(contributor_name) as donor, candidate_name, contributor_type, sum(amount) as total_amount, count(*) as contributions, max(date) as latest",
     "$where": clauses.join(" AND "),
-    "$group": "upper(contributor_name), candidate_name, contributor_type",
+    "$group": "office, upper(contributor_name), candidate_name, contributor_type",
     "$order": "total_amount DESC",
     "$limit": "50000",
   });
   const response = await fetch(`${CONTRIBUTIONS_ENDPOINT}?${params}`, { headers: { Accept: "application/json" } });
   if (!response.ok) throw new Error(`The member-comparison campaign-data query failed (${response.status}).`);
-  const ranked = rankedMemberDonors(await response.json(), first.candidate, second.candidate, args.sort_by === "frequency" ? "frequency" : "amount");
+  const ranked = rankedMemberDonors(await response.json(), first, second, args.sort_by === "frequency" ? "frequency" : "amount");
   const limit = Math.min(200, Math.max(1, Number(args.limit) || 50));
   return {
     members: {
-      first: { name: first.name, candidate: first.candidate, current: first.current !== false },
-      second: { name: second.name, candidate: second.candidate, current: second.current !== false },
+      first: { name: first.name, candidate: first.candidate, chamber: first.chamber, current: first.current !== false },
+      second: { name: second.name, candidate: second.candidate, chamber: second.chamber, current: second.current !== false },
     },
-    filters: { from_date: fromDate, to_date: toDate, data_available_through: dataAvailableThrough, election_period: args.election_period || "all", exclude_individuals: Boolean(args.exclude_individuals), sort_by: args.sort_by === "frequency" ? "frequency" : "amount" },
+    filters: { from_date: fromDate, to_date: toDate, data_available_through: dataAvailableThrough, chamber_horizons: Object.fromEntries(chamberEntries), election_period: args.election_period || "all", exclude_individuals: Boolean(args.exclude_individuals), sort_by: args.sort_by === "frequency" ? "frequency" : "amount" },
     counts: { first_only: ranked.first_only.length, shared: ranked.shared.length, second_only: ranked.second_only.length },
     first_only: ranked.first_only.slice(0, limit),
     shared: ranked.shared.slice(0, limit),
@@ -350,40 +380,41 @@ async function queryFirstWinnerOverlap(args, context) {
 const queryTool = {
   type: "function",
   name: "query_contributions",
-  description: "Query Hawaii Campaign Spending Commission Schedule A receipts for current or former 2020-2026 Hawaii House members. Empty candidate_names means the current roster. Use this for every numerical contribution claim.",
+  description: "Query Hawaii Campaign Spending Commission Schedule A receipts for tracked 2020-2026 Hawaii House members, senators, or both chambers. Empty candidate_names means the current roster in the selected chamber scope. Use this for every numerical contribution claim.",
   strict: true,
   parameters: {
     type: "object",
     additionalProperties: false,
     properties: {
-      candidate_names: { type: "array", items: { type: "string" }, description: "Current or former 2020-2026 House member names; full names, filing names, and unique surnames are accepted. Empty means all current House members." },
+      chamber: { type: "string", enum: ["house", "senate", "both"], description: "Chamber scope. Use both for cross-chamber donor questions." },
+      candidate_names: { type: "array", items: { type: "string" }, description: "Current or former 2020-2026 House or Senate officeholder names. Include House or Senate when a name is ambiguous. Empty means all current members in the selected chamber scope." },
       contributor_query: { type: "string", description: "Optional donor, employer, or occupation word fragment. Empty means any." },
       election_period: { type: "string", description: "Exact reported cycle, such as 2024-2026. Empty means any." },
       from_date: { type: "string", description: "YYYY-MM-DD. Empty defaults to 2020-01-01." },
-      to_date: { type: "string", description: "YYYY-MM-DD. Empty defaults to the latest available 2026 receipt for the current elected House roster." },
+      to_date: { type: "string", description: "YYYY-MM-DD. Empty defaults to the latest common 2026 receipt horizon for the selected chamber scope." },
       exclude_individuals: { type: "boolean", description: "True limits results to organizational, PAC, party, union, and other non-individual contributor types." },
       group_by: { type: "string", enum: ["donor_candidate_cycle", "donor_name", "donor", "candidate_cycle", "raw"] },
       sort_by: { type: "string", enum: ["amount", "frequency", "recipients", "date"] },
       limit: { type: "integer", minimum: 1, maximum: 500 },
     },
-    required: ["candidate_names", "contributor_query", "election_period", "from_date", "to_date", "exclude_individuals", "group_by", "sort_by", "limit"],
+    required: ["chamber", "candidate_names", "contributor_query", "election_period", "from_date", "to_date", "exclude_individuals", "group_by", "sort_by", "limit"],
   },
 };
 
 const memberDonorComparisonTool = {
   type: "function",
   name: "compare_member_donors",
-  description: "Deterministically compare donor universes for two named current or former Hawaii House members from 2020 onward. Returns donors unique to each member and donors shared by both.",
+  description: "Deterministically compare donor universes for any two named current or former Hawaii House or Senate officeholders from 2020 onward, including cross-chamber comparisons. Returns donors unique to each member and shared by both.",
   strict: true,
   parameters: {
     type: "object",
     additionalProperties: false,
     properties: {
-      first_candidate: { type: "string", description: "First current or former 2020-2026 House member; full name, filing name, or unique surname." },
-      second_candidate: { type: "string", description: "Second current or former 2020-2026 House member; full name, filing name, or unique surname." },
+      first_candidate: { type: "string", description: "First current or former 2020-2026 House or Senate officeholder. Include the chamber if needed." },
+      second_candidate: { type: "string", description: "Second current or former 2020-2026 House or Senate officeholder. Include the chamber if needed." },
       election_period: { type: "string", description: "Exact reported cycle, such as 2022-2024. Empty means all cycles in the date window." },
       from_date: { type: "string", description: "YYYY-MM-DD. Empty defaults to 2020-01-01." },
-      to_date: { type: "string", description: "YYYY-MM-DD. Empty uses the latest available House receipt in 2026." },
+      to_date: { type: "string", description: "YYYY-MM-DD. Empty uses the earlier live horizon of the two selected chambers." },
       exclude_individuals: { type: "boolean" },
       sort_by: { type: "string", enum: ["amount", "frequency"] },
       limit: { type: "integer", minimum: 1, maximum: 200 },
@@ -432,14 +463,18 @@ export default async function handler(req, res) {
   try {
     const context = await loadContext();
     const compactContext = {
-      current_members: context.currentMembers.map(({ candidate, name, district, party }) => ({ candidate, name, district, party })),
+      current_house_members: context.currentMembers.map(({ candidate, name, district, party }) => ({ candidate, name, district, party })),
       former_house_members_2020_2026: context.formerHouseMembers.map(({ candidate, name, district, districts, party, servedFrom, servedTo }) => ({ candidate, name, district, districts, party, servedFrom, servedTo })),
-      role_periods: context.periods,
-      role_changes: context.roleChanges,
+      current_senators: context.currentSenators.map(({ candidate, filingAliases, name, district, party }) => ({ candidate, filingAliases, name, district, party })),
+      former_senators_2020_2026: context.formerSenators.map(({ candidate, name, district, districts, party, servedFrom, servedTo }) => ({ candidate, name, district, districts, party, servedFrom, servedTo })),
+      house_role_periods: context.periods,
+      senate_role_periods: context.senatePeriods,
+      house_role_changes: context.roleChanges,
+      senate_role_changes: context.senateRoleChanges,
       first_winner_cycles: context.winnerCycles,
     };
     const model = process.env.OPENAI_MODEL?.trim() || "gpt-5.4-mini";
-    const instructions = `You are the research assistant inside the Hawaii House Leadership Research Desk. Answer concisely from the official filing data and role context. Use a data tool for every numerical claim. The research roster includes current members and former representatives who served during 2020-2026. Empty-roster queries default to current members, but explicit named-member lookups must support both current and former members. When a question compares two named members, asks who gave to one but not the other, or asks for shared donors, always use compare_member_donors and present the requested exclusive or shared list with aggregate dollars and contribution counts. For current, latest, recent, or 2026 contribution questions, use the reported 2024-2026 election period when appropriate and leave to_date empty so the tool includes records through the latest available 2026 current-member receipt; never stop at December 31, 2025 unless the user explicitly requests that cutoff. Treat majority and minority leadership as separate cohorts. For historical first-winner or cross-cycle donor-overlap questions, always use query_first_winner_overlap instead of manually merging query results. A successful Democratic first-House-ballot cohort means party=D, first_house_ballot_only=true, and years=[2020,2022,2024]. Put the tool's cross_cycle table first, preserving its deterministic ranking and counts exactly, followed by no more than five leading rows from each cohort. If a question asks whom to call, target, solicit, or approach based on political-giving history, do not create an individual-person prospect list. Instead, automatically call query_first_winner_overlap with exclude_individuals=true and provide a neutral historical analysis of recurring organizational, PAC, union, party, trade-association, business, and nonprofit contributors, explaining that substitution briefly. Distinguish reported contributor names from verified entities, never infer motive or influence, and flag alias, amendment, itemization, address, and timing limitations when relevant. If the data cannot support a claim, say so. Role and tracked-member context follows:\n${JSON.stringify(compactContext)}`;
+    const instructions = `You are the research assistant inside the Hawaii Legislature Contribution Research Desk. Answer concisely from the official filing data and role context. Use a data tool for every numerical claim. The research roster includes current and former House members and senators who served during 2020-2026. Keep House and Senate labels explicit; never merge chamber cohorts or denominators. For a general House question use chamber=house, for a Senate question use chamber=senate, and for chamber overlap use chamber=both. When a question compares two named officeholders, asks who gave to one but not the other, or asks for shared donors, always use compare_member_donors; it supports House-to-House, Senate-to-Senate, and House-to-Senate comparisons. Present the requested exclusive or shared list with aggregate dollars and contribution counts. For current, latest, recent, or 2026 questions, leave to_date empty so tools use the latest live chamber horizon; a both-chamber comparison uses the earlier horizon. Treat majority and minority leadership as separate cohorts. House first-winner questions still use query_first_winner_overlap; no Senate first-winner cohort has been certified in this research layer yet. A successful Democratic first-House-ballot cohort means party=D, first_house_ballot_only=true, and years=[2020,2022,2024]. If a question asks whom to call, target, solicit, or approach based on political-giving history, do not create an individual-person prospect list. Instead provide neutral historical analysis of recurring organizational, PAC, union, party, trade-association, business, and nonprofit contributors. Distinguish reported contributor names from verified entities, never infer motive or influence, and flag aliases, amendments, itemization, address, staggered Senate election cycles, and timing limitations when relevant. If the data cannot support a claim, say so. Role and tracked-member context follows:\n${JSON.stringify(compactContext)}`;
     let input = [{ role: "user", content: question }], dataCalls = 0;
     for (let turn = 0; turn < 4; turn += 1) {
       const openAIResponse = await fetch(OPENAI_ENDPOINT, {
